@@ -1,325 +1,136 @@
-"""Feature extraction module for Ares Optimizer.
-
-This module handles the extraction of features from code and performance metrics
-to represent the state of the optimization process.
+"""
+Feature extraction module for Ares - converts code and performance metrics into numerical state vectors.
 """
 
 import ast
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Tuple, Union
 
 import numpy as np
-from ..code_transformer.ast_manipulator import ASTManipulator
 
 
 class FeatureExtractor:
-    """Extracts features from code and performance metrics for state representation."""
+    """
+    Extracts numerical features from code and performance metrics for RL state representation.
+    """
 
     def __init__(self):
         """Initialize the feature extractor."""
-        self.ast_manipulator = ASTManipulator()
+        # Define feature names for better tracking
+        self.ast_features = [
+            "num_lines",
+            "num_chars",
+            "num_functions",
+            "num_loops",
+            "num_conditionals",
+            "num_assignments",
+            "num_returns",
+            "max_depth",
+            "has_yield",
+            "has_lambda",
+            "has_list_comp",
+            "has_dict_comp",
+            "has_set_comp",
+            "has_generator",
+        ]
 
-    def extract_code_features(self, code: str, function_name: str) -> Dict[str, float]:
-        """Extract features from the code structure.
+    def extract_ast_features(self, code_string: str) -> Dict[str, float]:
+        """
+        Extract features from the AST of the code.
 
         Args:
-            code: The Python code to analyze.
-            function_name: Name of the function to analyze.
+            code_string: The Python code to analyze.
 
         Returns:
-            Dictionary of code features.
+            Dictionary of feature names and their values.
         """
-        tree = self.ast_manipulator.parse_code(code)
-        if not tree:
-            return {}
-
-        func_def = self.ast_manipulator.get_function_by_name(tree, function_name)
-        if not func_def:
-            return {}
+        try:
+            tree = ast.parse(code_string)
+        except SyntaxError:
+            return {feature: 0.0 for feature in self.ast_features}
 
         features = {
-            "cyclomatic_complexity": self._calculate_cyclomatic_complexity(func_def),
-            "num_loops": self._count_loops(func_def),
-            "num_conditionals": self._count_conditionals(func_def),
-            "num_function_calls": self._count_function_calls(func_def),
-            "num_variables": len(self._get_variables(func_def)),
-            "num_parameters": len(func_def.args.args),
-            "has_recursion": self._has_recursion(func_def),
-            "has_list_operations": self._has_list_operations(func_def),
-            "has_dict_operations": self._has_dict_operations(func_def),
-            "has_set_operations": self._has_set_operations(func_def),
-            "has_numpy_operations": self._has_numpy_operations(func_def),
-            "has_generator_expression": self._has_generator_expression(func_def),
-            "has_list_comprehension": self._has_list_comprehension(func_def),
-            "has_decorators": len(func_def.decorator_list) > 0,
-            "has_type_hints": self._has_type_hints(func_def),
-            "code_length": len(code.splitlines()),
+            "num_lines": len(code_string.splitlines()),
+            "num_chars": len(code_string),
+            "num_functions": len([node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)]),
+            "num_loops": len([node for node in ast.walk(tree) if isinstance(node, (ast.For, ast.While))]),
+            "num_conditionals": len([node for node in ast.walk(tree) if isinstance(node, ast.If)]),
+            "num_assignments": len([node for node in ast.walk(tree) if isinstance(node, ast.Assign)]),
+            "num_returns": len([node for node in ast.walk(tree) if isinstance(node, ast.Return)]),
+            "max_depth": self._calculate_max_depth(tree),
+            "has_yield": float(any(isinstance(node, ast.Yield) for node in ast.walk(tree))),
+            "has_lambda": float(any(isinstance(node, ast.Lambda) for node in ast.walk(tree))),
+            "has_list_comp": float(any(isinstance(node, ast.ListComp) for node in ast.walk(tree))),
+            "has_dict_comp": float(any(isinstance(node, ast.DictComp) for node in ast.walk(tree))),
+            "has_set_comp": float(any(isinstance(node, ast.SetComp) for node in ast.walk(tree))),
+            "has_generator": float(any(isinstance(node, ast.GeneratorExp) for node in ast.walk(tree))),
         }
 
         return features
 
-    def extract_performance_features(self, metrics: Dict[str, float]) -> Dict[str, float]:
-        """Extract features from performance metrics.
+    def extract_performance_features(
+        self, runtime_ms: float, memory_mb: float
+    ) -> Dict[str, float]:
+        """
+        Extract features from performance metrics.
 
         Args:
-            metrics: Dictionary of performance metrics.
+            runtime_ms: Runtime in milliseconds
+            memory_mb: Memory usage in megabytes
 
         Returns:
-            Dictionary of performance features.
+            Dictionary of performance features
         """
+        # Normalize performance metrics (using log scale for better distribution)
         features = {
-            "runtime": metrics.get("runtime", 0.0),
-            "memory_usage": metrics.get("memory_usage", 0.0),
-            "cpu_usage": metrics.get("cpu_usage", 0.0),
-            "io_operations": metrics.get("io_operations", 0.0),
-            "cache_hits": metrics.get("cache_hits", 0.0),
-            "cache_misses": metrics.get("cache_misses", 0.0),
+            "log_runtime": np.log1p(runtime_ms),
+            "log_memory": np.log1p(memory_mb),
+            "runtime": runtime_ms,
+            "memory": memory_mb,
         }
-
-        # Calculate derived features
-        if features["cache_hits"] + features["cache_misses"] > 0:
-            features["cache_hit_ratio"] = (
-                features["cache_hits"] / (features["cache_hits"] + features["cache_misses"])
-            )
-        else:
-            features["cache_hit_ratio"] = 0.0
-
         return features
 
-    def combine_features(
-        self, code_features: Dict[str, float], perf_features: Dict[str, float]
+    def get_state_vector(
+        self, code_string: str, runtime_ms: float, memory_mb: float
     ) -> np.ndarray:
-        """Combine code and performance features into a single feature vector.
+        """
+        Combine AST and performance features into a single state vector.
 
         Args:
-            code_features: Dictionary of code features.
-            perf_features: Dictionary of performance features.
+            code_string: The Python code to analyze
+            runtime_ms: Runtime in milliseconds
+            memory_mb: Memory usage in megabytes
 
         Returns:
-            Combined feature vector as numpy array.
+            NumPy array containing all features
         """
-        # Combine all features
-        all_features = {**code_features, **perf_features}
+        ast_features = self.extract_ast_features(code_string)
+        perf_features = self.extract_performance_features(runtime_ms, memory_mb)
 
-        # Convert to numpy array
-        feature_vector = np.array(list(all_features.values()), dtype=np.float32)
+        # Combine features in a consistent order
+        feature_vector = []
+        for feature in self.ast_features:
+            feature_vector.append(ast_features[feature])
+        for feature in ["log_runtime", "log_memory", "runtime", "memory"]:
+            feature_vector.append(perf_features[feature])
 
-        # Normalize features
-        feature_vector = self._normalize_features(feature_vector)
+        return np.array(feature_vector, dtype=np.float32)
 
-        return feature_vector
-
-    def _calculate_cyclomatic_complexity(self, node: ast.AST) -> int:
-        """Calculate cyclomatic complexity of a function.
+    def _calculate_max_depth(self, tree: ast.AST) -> float:
+        """
+        Calculate the maximum depth of the AST.
 
         Args:
-            node: The AST node to analyze.
+            tree: The AST to analyze
 
         Returns:
-            Cyclomatic complexity score.
+            Maximum depth of the AST
         """
-        complexity = 1  # Base complexity
+        def _get_depth(node: ast.AST, current_depth: int = 0) -> int:
+            if not isinstance(node, ast.AST):
+                return current_depth
+            max_depth = current_depth
+            for child in ast.iter_child_nodes(node):
+                max_depth = max(max_depth, _get_depth(child, current_depth + 1))
+            return max_depth
 
-        for child in ast.walk(node):
-            if isinstance(child, (ast.If, ast.While, ast.For, ast.FunctionDef)):
-                complexity += 1
-            elif isinstance(child, ast.BoolOp):
-                complexity += len(child.values) - 1
-            elif isinstance(child, ast.Try):
-                complexity += len(child.handlers)
-
-        return complexity
-
-    def _count_loops(self, node: ast.AST) -> int:
-        """Count the number of loops in the code.
-
-        Args:
-            node: The AST node to analyze.
-
-        Returns:
-            Number of loops.
-        """
-        return sum(1 for child in ast.walk(node) if isinstance(child, (ast.For, ast.While)))
-
-    def _count_conditionals(self, node: ast.AST) -> int:
-        """Count the number of conditional statements.
-
-        Args:
-            node: The AST node to analyze.
-
-        Returns:
-            Number of conditionals.
-        """
-        return sum(1 for child in ast.walk(node) if isinstance(child, ast.If))
-
-    def _count_function_calls(self, node: ast.AST) -> int:
-        """Count the number of function calls.
-
-        Args:
-            node: The AST node to analyze.
-
-        Returns:
-            Number of function calls.
-        """
-        return sum(1 for child in ast.walk(node) if isinstance(child, ast.Call))
-
-    def _get_variables(self, node: ast.AST) -> set:
-        """Get all variables used in the code.
-
-        Args:
-            node: The AST node to analyze.
-
-        Returns:
-            Set of variable names.
-        """
-        variables = set()
-        for child in ast.walk(node):
-            if isinstance(child, ast.Name):
-                variables.add(child.id)
-        return variables
-
-    def _has_recursion(self, node: ast.AST) -> bool:
-        """Check if the function contains recursion.
-
-        Args:
-            node: The AST node to analyze.
-
-        Returns:
-            True if recursion is present, False otherwise.
-        """
-        if not isinstance(node, ast.FunctionDef):
-            return False
-
-        function_name = node.name
-        for child in ast.walk(node):
-            if isinstance(child, ast.Call):
-                if isinstance(child.func, ast.Name) and child.func.id == function_name:
-                    return True
-        return False
-
-    def _has_list_operations(self, node: ast.AST) -> bool:
-        """Check if the code contains list operations.
-
-        Args:
-            node: The AST node to analyze.
-
-        Returns:
-            True if list operations are present, False otherwise.
-        """
-        for child in ast.walk(node):
-            if isinstance(child, ast.List):
-                return True
-            if isinstance(child, ast.Call):
-                if isinstance(child.func, ast.Name) and child.func.id in ("list", "append", "extend"):
-                    return True
-        return False
-
-    def _has_dict_operations(self, node: ast.AST) -> bool:
-        """Check if the code contains dictionary operations.
-
-        Args:
-            node: The AST node to analyze.
-
-        Returns:
-            True if dictionary operations are present, False otherwise.
-        """
-        for child in ast.walk(node):
-            if isinstance(child, ast.Dict):
-                return True
-            if isinstance(child, ast.Call):
-                if isinstance(child.func, ast.Name) and child.func.id in ("dict", "get", "update"):
-                    return True
-        return False
-
-    def _has_set_operations(self, node: ast.AST) -> bool:
-        """Check if the code contains set operations.
-
-        Args:
-            node: The AST node to analyze.
-
-        Returns:
-            True if set operations are present, False otherwise.
-        """
-        for child in ast.walk(node):
-            if isinstance(child, ast.Set):
-                return True
-            if isinstance(child, ast.Call):
-                if isinstance(child.func, ast.Name) and child.func.id in ("set", "add", "remove"):
-                    return True
-        return False
-
-    def _has_numpy_operations(self, node: ast.AST) -> bool:
-        """Check if the code contains NumPy operations.
-
-        Args:
-            node: The AST node to analyze.
-
-        Returns:
-            True if NumPy operations are present, False otherwise.
-        """
-        for child in ast.walk(node):
-            if isinstance(child, ast.Call):
-                if isinstance(child.func, ast.Attribute):
-                    if isinstance(child.func.value, ast.Name) and child.func.value.id == "np":
-                        return True
-        return False
-
-    def _has_generator_expression(self, node: ast.AST) -> bool:
-        """Check if the code contains generator expressions.
-
-        Args:
-            node: The AST node to analyze.
-
-        Returns:
-            True if generator expressions are present, False otherwise.
-        """
-        return any(isinstance(child, ast.GeneratorExp) for child in ast.walk(node))
-
-    def _has_list_comprehension(self, node: ast.AST) -> bool:
-        """Check if the code contains list comprehensions.
-
-        Args:
-            node: The AST node to analyze.
-
-        Returns:
-            True if list comprehensions are present, False otherwise.
-        """
-        return any(isinstance(child, ast.ListComp) for child in ast.walk(node))
-
-    def _has_type_hints(self, node: ast.AST) -> bool:
-        """Check if the code contains type hints.
-
-        Args:
-            node: The AST node to analyze.
-
-        Returns:
-            True if type hints are present, False otherwise.
-        """
-        if not isinstance(node, ast.FunctionDef):
-            return False
-
-        # Check return type annotation
-        if node.returns is not None:
-            return True
-
-        # Check argument type annotations
-        for arg in node.args.args:
-            if arg.annotation is not None:
-                return True
-
-        return False
-
-    def _normalize_features(self, features: np.ndarray) -> np.ndarray:
-        """Normalize feature values to [0, 1] range.
-
-        Args:
-            features: Feature vector to normalize.
-
-        Returns:
-            Normalized feature vector.
-        """
-        # Handle zero division
-        max_val = np.max(features)
-        if max_val == 0:
-            return features
-
-        return features / max_val 
+        return float(_get_depth(tree)) 

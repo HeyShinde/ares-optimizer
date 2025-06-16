@@ -1,10 +1,14 @@
 numpy>=2.3.0
 psutil>=7.0.0
 pytest>=8.4.0
+pytest-cov>=6.2.1
 torch>=2.7.1
 matplotlib>=3.10.2
 seaborn>=0.13.2
 streamlit>=1.45.1
 black>=25.1.0
 ruff>=0.11.13
+isort>=6.0.1
+mypy>=1.16.0
 gymnasium>=1.1.1
+astunparse>=1.6.3
