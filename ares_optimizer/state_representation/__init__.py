@@ -3,5 +3,5 @@ State representation module for Ares - handles feature extraction and preprocess
 """
 
 from ares_optimizer.state_representation.feature_extractor import FeatureExtractor
-
+ 
 __all__ = ["FeatureExtractor"] 

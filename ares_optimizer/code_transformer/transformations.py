@@ -5,15 +5,349 @@ Defines and implements specific code transformation actions.
 import ast
 import astunparse
 import functools
-from typing import Optional
+from typing import Optional, List, Dict, Any
 import logging
 
 logger = logging.getLogger(__name__)
+
+# --- Transformation Selection Helper ---
+def select_transformations(code: str) -> List[str]:
+    """
+    Analyzes code and returns a list of applicable transformations.
+    Returns a list of transformation function names that should be applied.
+    """
+    tree = ast.parse(code)
+    applicable_transforms = []
+    
+    # Check for patterns that indicate which transformations would be beneficial
+    for node in ast.walk(tree):
+        # Check for list membership tests
+        if isinstance(node, ast.Compare) and isinstance(node.ops[0], ast.In):
+            applicable_transforms.append('convert_list_to_set_for_membership')
+        
+        # Check for manual list construction
+        if isinstance(node, ast.For):
+            if any(isinstance(body, ast.Expr) and 
+                  isinstance(body.value, ast.Call) and 
+                  isinstance(body.value.func, ast.Attribute) and 
+                  body.value.func.attr == 'append' 
+                  for body in node.body):
+                applicable_transforms.append('replace_manual_list_append_with_list_comp')
+                applicable_transforms.append('replace_manual_list_with_map')
+        
+        # Check for range(len()) patterns
+        if isinstance(node, ast.For) and isinstance(node.iter, ast.Call):
+            if (isinstance(node.iter.func, ast.Name) and 
+                node.iter.func.id == 'range' and 
+                len(node.iter.args) == 1 and 
+                isinstance(node.iter.args[0], ast.Call) and 
+                isinstance(node.iter.args[0].func, ast.Name) and 
+                node.iter.args[0].func.id == 'len'):
+                applicable_transforms.append('replace_range_len_with_enumerate')
+        
+        # Check for max/min patterns
+        if isinstance(node, ast.For):
+            if (len(node.body) == 1 and 
+                isinstance(node.body[0], ast.If) and 
+                len(node.body[0].body) == 1 and 
+                isinstance(node.body[0].body[0], ast.Assign)):
+                applicable_transforms.append('use_builtin_functions')
+        
+        # Check for generator patterns
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id in ['sum', 'any', 'all'] and len(node.args) == 1:
+                if isinstance(node.args[0], ast.ListComp):
+                    applicable_transforms.append('use_generator_expression')
+        
+        # Check for caching opportunities
+        if isinstance(node, ast.FunctionDef):
+            if any(isinstance(body, ast.Return) for body in node.body):
+                applicable_transforms.append('apply_lru_cache')
+    
+    return list(set(applicable_transforms))
+
+# --- New Transformation: Use Set Operations ---
+def use_set_operations(code: str) -> str:
+    """
+    Replaces list operations with set operations where appropriate.
+    Example:
+        result = []
+        for x in list1:
+            if x in list2:
+                result.append(x)
+        # becomes
+        result = list(set(list1) & set(list2))
+    """
+    try:
+        tree = ast.parse(code)
+        class SetOperationTransformer(ast.NodeTransformer):
+            def visit_Module(self, node):
+                new_body = []
+                i = 0
+                while i < len(node.body):
+                    stmt = node.body[i]
+                    
+                    # Look for intersection pattern
+                    if (isinstance(stmt, ast.Assign) and
+                        len(stmt.targets) == 1 and
+                        isinstance(stmt.targets[0], ast.Name) and
+                        isinstance(stmt.value, ast.List) and
+                        i + 1 < len(node.body) and
+                        isinstance(node.body[i + 1], ast.For)):
+                        
+                        for_node = node.body[i + 1]
+                        if (len(for_node.body) == 1 and
+                            isinstance(for_node.body[0], ast.If) and
+                            isinstance(for_node.body[0].test, ast.Compare) and
+                            isinstance(for_node.body[0].test.ops[0], ast.In) and
+                            len(for_node.body[0].body) == 1 and
+                            isinstance(for_node.body[0].body[0], ast.Expr) and
+                            isinstance(for_node.body[0].body[0].value, ast.Call) and
+                            isinstance(for_node.body[0].body[0].value.func, ast.Attribute) and
+                            for_node.body[0].body[0].value.func.attr == 'append'):
+                            
+                            # Get the lists involved
+                            list1 = for_node.iter
+                            list2 = for_node.body[0].test.comparators[0]
+                            
+                            # Create set intersection
+                            new_body.append(ast.Assign(
+                                targets=[ast.Name(id=stmt.targets[0].id, ctx=ast.Store())],
+                                value=ast.Call(
+                                    func=ast.Name(id='list', ctx=ast.Load()),
+                                    args=[
+                                        ast.BinOp(
+                                            left=ast.Call(
+                                                func=ast.Name(id='set', ctx=ast.Load()),
+                                                args=[list1],
+                                                keywords=[]
+                                            ),
+                                            op=ast.BitAnd(),
+                                            right=ast.Call(
+                                                func=ast.Name(id='set', ctx=ast.Load()),
+                                                args=[list2],
+                                                keywords=[]
+                                            )
+                                        )
+                                    ],
+                                    keywords=[]
+                                )
+                            ))
+                            i += 2
+                            continue
+                    
+                    new_body.append(stmt)
+                    i += 1
+                node.body = new_body
+                return node
+        
+        tree = SetOperationTransformer().visit(tree)
+        ast.fix_missing_locations(tree)
+        return ast.unparse(tree)
+    except Exception as e:
+        logging.error(f"Error in use_set_operations: {str(e)}")
+        return code
+
+# --- New Transformation: Use List Comprehension with Condition ---
+def use_list_comp_with_condition(code: str) -> str:
+    """
+    Replaces filter+map patterns with list comprehension.
+    Example:
+        result = []
+        for x in items:
+            if condition(x):
+                result.append(transform(x))
+        # becomes
+        result = [transform(x) for x in items if condition(x)]
+    """
+    try:
+        tree = ast.parse(code)
+        class ListCompWithConditionTransformer(ast.NodeTransformer):
+            def visit_Module(self, node):
+                new_body = []
+                i = 0
+                while i < len(node.body):
+                    stmt = node.body[i]
+                    
+                    if (isinstance(stmt, ast.Assign) and
+                        len(stmt.targets) == 1 and
+                        isinstance(stmt.targets[0], ast.Name) and
+                        isinstance(stmt.value, ast.List) and
+                        i + 1 < len(node.body) and
+                        isinstance(node.body[i + 1], ast.For)):
+                        
+                        for_node = node.body[i + 1]
+                        if (len(for_node.body) == 1 and
+                            isinstance(for_node.body[0], ast.If) and
+                            len(for_node.body[0].body) == 1 and
+                            isinstance(for_node.body[0].body[0], ast.Expr) and
+                            isinstance(for_node.body[0].body[0].value, ast.Call) and
+                            isinstance(for_node.body[0].body[0].value.func, ast.Attribute) and
+                            for_node.body[0].body[0].value.func.attr == 'append'):
+                            
+                            # Get the transformation and condition
+                            transform = for_node.body[0].body[0].value.args[0]
+                            condition = for_node.body[0].test
+                            
+                            # Create list comprehension
+                            new_body.append(ast.Assign(
+                                targets=[ast.Name(id=stmt.targets[0].id, ctx=ast.Store())],
+                                value=ast.ListComp(
+                                    elt=transform,
+                                    generators=[
+                                        ast.comprehension(
+                                            target=for_node.target,
+                                            iter=for_node.iter,
+                                            ifs=[condition],
+                                            is_async=0
+                                        )
+                                    ]
+                                )
+                            ))
+                            i += 2
+                            continue
+                    
+                    new_body.append(stmt)
+                    i += 1
+                node.body = new_body
+                return node
+        
+        tree = ListCompWithConditionTransformer().visit(tree)
+        ast.fix_missing_locations(tree)
+        return ast.unparse(tree)
+    except Exception as e:
+        logging.error(f"Error in use_list_comp_with_condition: {str(e)}")
+        return code
+
+# --- New Transformation: Use Dictionary Comprehension ---
+def use_dict_comprehension(code: str) -> str:
+    """
+    Replaces dictionary construction loops with dictionary comprehension.
+    Example:
+        result = {}
+        for k, v in items:
+            result[k] = v
+        # becomes
+        result = {k: v for k, v in items}
+    """
+    try:
+        tree = ast.parse(code)
+        class DictCompTransformer(ast.NodeTransformer):
+            def visit_Module(self, node):
+                new_body = []
+                i = 0
+                while i < len(node.body):
+                    stmt = node.body[i]
+                    
+                    if (isinstance(stmt, ast.Assign) and
+                        len(stmt.targets) == 1 and
+                        isinstance(stmt.targets[0], ast.Name) and
+                        isinstance(stmt.value, ast.Dict) and
+                        i + 1 < len(node.body) and
+                        isinstance(node.body[i + 1], ast.For)):
+                        
+                        for_node = node.body[i + 1]
+                        if (len(for_node.body) == 1 and
+                            isinstance(for_node.body[0], ast.Assign) and
+                            isinstance(for_node.body[0].targets[0], ast.Subscript) and
+                            isinstance(for_node.body[0].targets[0].value, ast.Name) and
+                            for_node.body[0].targets[0].value.id == stmt.targets[0].id):
+                            
+                            # Get the key and value
+                            key = for_node.body[0].targets[0].slice
+                            value = for_node.body[0].value
+                            
+                            # Create dictionary comprehension
+                            new_body.append(ast.Assign(
+                                targets=[ast.Name(id=stmt.targets[0].id, ctx=ast.Store())],
+                                value=ast.DictComp(
+                                    key=key,
+                                    value=value,
+                                    generators=[
+                                        ast.comprehension(
+                                            target=for_node.target,
+                                            iter=for_node.iter,
+                                            ifs=[],
+                                            is_async=0
+                                        )
+                                    ]
+                                )
+                            ))
+                            i += 2
+                            continue
+                    
+                    new_body.append(stmt)
+                    i += 1
+                node.body = new_body
+                return node
+        
+        tree = DictCompTransformer().visit(tree)
+        ast.fix_missing_locations(tree)
+        return ast.unparse(tree)
+    except Exception as e:
+        logging.error(f"Error in use_dict_comprehension: {str(e)}")
+        return code
+
+# --- New Transformation: Use Generator Functions ---
+def use_generator_functions(code: str) -> str:
+    """
+    Replaces list-building functions with generator functions.
+    Example:
+        def get_items():
+            result = []
+            for x in range(10):
+                result.append(x * 2)
+            return result
+        # becomes
+        def get_items():
+            for x in range(10):
+                yield x * 2
+    """
+    try:
+        tree = ast.parse(code)
+        class GeneratorFunctionTransformer(ast.NodeTransformer):
+            def visit_FunctionDef(self, node):
+                # Check if function builds and returns a list
+                if (len(node.body) >= 2 and
+                    isinstance(node.body[0], ast.Assign) and
+                    isinstance(node.body[0].value, ast.List) and
+                    isinstance(node.body[-1], ast.Return) and
+                    isinstance(node.body[-1].value, ast.Name) and
+                    node.body[-1].value.id == node.body[0].targets[0].id):
+                    
+                    # Check if there's a for loop that appends to the list
+                    for i, stmt in enumerate(node.body[1:-1]):
+                        if (isinstance(stmt, ast.For) and
+                            len(stmt.body) == 1 and
+                            isinstance(stmt.body[0], ast.Expr) and
+                            isinstance(stmt.body[0].value, ast.Call) and
+                            isinstance(stmt.body[0].value.func, ast.Attribute) and
+                            stmt.body[0].value.func.attr == 'append'):
+                            
+                            # Convert to generator function
+                            node.body = [
+                                ast.For(
+                                    target=stmt.target,
+                                    iter=stmt.iter,
+                                    body=[ast.Expr(value=ast.Yield(value=stmt.body[0].value.args[0]))],
+                                    orelse=[]
+                                )
+                            ]
+                            return node
+                return node
+        
+        tree = GeneratorFunctionTransformer().visit(tree)
+        ast.fix_missing_locations(tree)
+        return ast.unparse(tree)
+    except Exception as e:
+        logging.error(f"Error in use_generator_functions: {str(e)}")
+        return code
 
 # --- Transformation 1: Apply @functools.lru_cache ---
 def apply_lru_cache(code_string: str, function_name: str = None) -> str:
     """
     Adds @functools.lru_cache to the specified function (or the first function if not specified).
+    Also ensures 'import functools' is present at the top of the code.
     """
     logger.info(f"Applying lru_cache to function: {function_name}")
     logger.info(f"Original code:\n{code_string}")
@@ -34,6 +368,9 @@ def apply_lru_cache(code_string: str, function_name: str = None) -> str:
                 node.decorator_list.insert(0, decorator)
                 break
     result = astunparse.unparse(tree)
+    # Ensure 'import functools' is present
+    if 'import functools' not in result:
+        result = 'import functools\n' + result
     logger.info(f"Transformed code:\n{result}")
     return result
 
@@ -735,3 +1072,50 @@ def apply_numpy_vectorization(code: str) -> str:
     except Exception as e:
         logging.error(f"Error in apply_numpy_vectorization: {str(e)}")
         return code
+
+# --- Transformation Application Helper ---
+def apply_transformations(code: str, transformations: List[str]) -> str:
+    """
+    Applies the specified transformations to the code in an optimal order.
+    """
+    # Define transformation dependencies and order
+    transform_order = [
+        'use_set_operations',
+        'use_list_comp_with_condition',
+        'use_dict_comprehension',
+        'use_generator_functions',
+        'convert_list_to_set_for_membership',
+        'replace_manual_list_append_with_list_comp',
+        'replace_manual_list_with_map',
+        'replace_range_len_with_enumerate',
+        'use_builtin_functions',
+        'use_generator_expression',
+        'apply_lru_cache',
+        'unroll_small_loop',
+        'apply_numpy_vectorization'
+    ]
+    
+    # Filter and sort transformations
+    applicable_transforms = [t for t in transform_order if t in transformations]
+    
+    # Apply transformations in order
+    result = code
+    for transform_name in applicable_transforms:
+        transform_func = globals()[transform_name]
+        try:
+            result = transform_func(result)
+        except Exception as e:
+            logging.error(f"Error applying {transform_name}: {str(e)}")
+    
+    return result
+
+# --- Main Transformation Function ---
+def transform_code(code: str) -> str:
+    """
+    Main function to transform code using all applicable optimizations.
+    """
+    # Select applicable transformations
+    transformations = select_transformations(code)
+    
+    # Apply transformations
+    return apply_transformations(code, transformations)
